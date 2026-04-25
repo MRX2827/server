@@ -4,24 +4,25 @@
 package main
 
 import (
- "encoding/json"
- "fmt"
- "log"
- "net/http"
- "sync"
- "time"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
 
- "github.com/gorilla/websocket"
+	"github.com/gorilla/websocket"
 )
 
 // ── Типы сообщений ──────────────────────────────────────────────────────────
 
 type Message struct {
- Type    string json:"type"
- ChatID  string json:"chatId"
- UserID  string json:"userId"
- Content string json:"content"
- Time    int64  json:"time"
+	Type    string `json:"type"`
+	ChatID  string `json:"chatId"`
+	UserID  string `json:"userId"`
+	Content string `json:"content"`
+	Time    int64  `json:"time"`
 }
 
 // ── Hub — сердце сервера ────────────────────────────────────────────────────
@@ -178,7 +179,7 @@ func wsHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
  }
 
  client := &Client{id: userID, conn: conn, send: make(chan []byte, 256), hub: hub}
-[25.04.2026 22:28] MRX 2.0:  // Добавляем в чат
+ // Добавляем в чат
  hub.mu.Lock()
  hub.chats[chatID] = append(hub.chats[chatID], client)
  hub.mu.Unlock()
@@ -191,7 +192,8 @@ func wsHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
- fmt.Fprintf(w, {"status":"ok","server":"RedMrxGram v0.1"})
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","server":"RedMrxGram v0.1"}`)
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -205,12 +207,15 @@ func main() {
  })
  http.HandleFunc("/health", healthHandler)
 
- port := ":8080"
- log.Printf("🚀 RedMrxGram WebSocket Server started on %s", port)
- log.Printf("   Connect: ws://localhost%s/ws?userId=USER_ID&chatId=CHAT_ID", port)
- log.Printf("   Health:  http://localhost%s/health", port)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	log.Printf("🚀 RedMrxGram WebSocket Server started on :%s", port)
+	log.Printf("   Connect: ws://localhost:%s/ws?userId=USER_ID&chatId=CHAT_ID", port)
+	log.Printf("   Health:  http://localhost:%s/health", port)
 
- if err := http.ListenAndServe(port, nil); err != nil {
+	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
   log.Fatal("Server error:", err)
  }
 }
