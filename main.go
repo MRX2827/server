@@ -1,352 +1,216 @@
+// RedMrxGram WebSocket Server
+// Запуск: go mod init redmrxgram && go get github.com/gorilla/websocket && go run main.go
+
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"strings"
-	"sync"
-	"time"
+ "encoding/json"
+ "fmt"
+ "log"
+ "net/http"
+ "sync"
+ "time"
 
-	"github.com/gorilla/websocket"
+ "github.com/gorilla/websocket"
 )
 
-type User struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Tag      string `json:"tag"`
-	Bio      string `json:"bio"`
-	PhotoURL string `json:"photoUrl"`
-	Online   bool   `json:"online"`
-	LastSeen int64  `json:"lastSeen"`
-	FCMToken string `json:"fcmToken,omitempty"`
-}
+// ── Типы сообщений ──────────────────────────────────────────────────────────
 
 type Message struct {
-	ID       string      `json:"id"`
-	ChatID   string      `json:"chatId"`
-	SenderID string      `json:"senderId"`
-	Author   string      `json:"author"`
-	Type     string      `json:"type"`
-	Text     string      `json:"text"`
-	FileURL  string      `json:"fileUrl,omitempty"`
-	FileData string      `json:"fileData,omitempty"`
-	FileName string      `json:"fileName,omitempty"`
-	FileType string      `json:"fileType,omitempty"`
-	FileSize int64       `json:"fileSize,omitempty"`
-	Duration string      `json:"duration,omitempty"`
-	VideoURL string      `json:"videoUrl,omitempty"`
-	ReplyTo  interface{} `json:"replyTo,omitempty"`
-	Time     string      `json:"time"`
-	UnixMs   int64       `json:"unixMs"`
+ Type    string json:"type"
+ ChatID  string json:"chatId"
+ UserID  string json:"userId"
+ Content string json:"content"
+ Time    int64  json:"time"
 }
 
-type WSMessage struct {
-	Event   string          `json:"event"`
-	Payload json.RawMessage `json:"payload"`
-}
+// ── Hub — сердце сервера ────────────────────────────────────────────────────
 
 type Client struct {
-	userID string
-	conn   *websocket.Conn
-	send   chan []byte
+ id   string
+ conn *websocket.Conn
+ send chan []byte
+ hub  *Hub
 }
 
-var (
-	mu          sync.RWMutex
-	users       = make(map[string]*User)
-	messages    = make(map[string][]Message)
-	clients     = make(map[string]*Client)
-	chatMembers = make(map[string][]string)
-)
+type Hub struct {
+ clients    map[string]*Client  // userId -> Client
+ chats      map[string][]*Client // chatId -> []Clients
+ register   chan *Client
+ unregister chan *Client
+ broadcast  chan *Message
+ mu         sync.RWMutex
+}
+
+func newHub() *Hub {
+ return &Hub{
+  clients:    make(map[string]*Client),
+  chats:      make(map[string][]*Client),
+  register:   make(chan *Client),
+  unregister: make(chan *Client),
+  broadcast:  make(chan *Message, 256),
+ }
+}
+
+func (h *Hub) run() {
+ for {
+  select {
+  case client := <-h.register:
+   h.mu.Lock()
+   h.clients[client.id] = client
+   h.mu.Unlock()
+   log.Printf("✅ User connected: %s | Total: %d", client.id, len(h.clients))
+
+  case client := <-h.unregister:
+   h.mu.Lock()
+   if _, ok := h.clients[client.id]; ok {
+    delete(h.clients, client.id)
+    close(client.send)
+   }
+   h.mu.Unlock()
+   log.Printf("❌ User disconnected: %s | Total: %d", client.id, len(h.clients))
+
+  case msg := <-h.broadcast:
+   h.mu.RLock()
+   members := h.chats[msg.ChatID]
+   h.mu.RUnlock()
+
+   data, _ := json.Marshal(msg)
+   for _, c := range members {
+    if c.id != msg.UserID { // не отправляем себе
+     select {
+     case c.send <- data:
+     default:
+      close(c.send)
+     }
+    }
+   }
+  }
+ }
+}
+
+// ── Client goroutines ───────────────────────────────────────────────────────
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+ ReadBufferSize:  1024,
+ WriteBufferSize: 1024,
+ CheckOrigin:     func(r *http.Request) bool { return true }, // TODO: проверять origin в проде
 }
 
-func broadcast(chatID, senderID string, data []byte) {
-	mu.RLock()
-	members := chatMembers[chatID]
-	mu.RUnlock()
-	for _, uid := range members {
-		if uid == senderID {
-			continue
-		}
-		mu.RLock()
-		c := clients[uid]
-		mu.RUnlock()
-		if c != nil {
-			select {
-			case c.send <- data:
-			default:
-			}
-		}
-	}
+func (c *Client) readPump() {
+ defer func() {
+  c.hub.unregister <- c
+  c.conn.Close()
+ }()
+
+ c.conn.SetReadLimit(512 * 1024) // 512KB max message
+ c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+ c.conn.SetPongHandler(func(string) error {
+  c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+  return nil
+ })
+
+ for {
+  _, data, err := c.conn.ReadMessage()
+  if err != nil {
+   break
+  }
+
+  var msg Message
+  if err := json.Unmarshal(data, &msg); err != nil {
+   continue
+  }
+
+  msg.UserID = c.id
+  msg.Time = time.Now().UnixMilli()
+
+  // TODO: сохранить в PostgreSQL/TimescaleDB
+  log.Printf("📨 [%s] %s: %s", msg.ChatID, msg.UserID, msg.Content)
+
+  c.hub.broadcast <- &msg
+ }
 }
 
-func cors(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	w.Header().Set("Content-Type", "application/json")
+func (c *Client) writePump() {
+ ticker := time.NewTicker(54 * time.Second)
+ defer func() {
+  ticker.Stop()
+  c.conn.Close()
+ }()
+
+ for {
+  select {
+  case message, ok := <-c.send:
+   c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+   if !ok {
+    c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+    return
+   }
+   if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+    return
+   }
+
+  case <-ticker.C:
+   // Ping каждые 54 секунды чтобы держать соединение живым
+   c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+   if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+    return
+   }
+  }
+ }
 }
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	userID := r.URL.Query().Get("userId")
-	if userID == "" {
-		http.Error(w, "userId required", 400)
-		return
-	}
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	client := &Client{userID: userID, conn: conn, send: make(chan []byte, 512)}
-	mu.Lock()
-	clients[userID] = client
-	if u, ok := users[userID]; ok {
-		u.Online = true
-	}
-	mu.Unlock()
-	log.Printf("Connected: %s | Online: %d", userID, len(clients))
+// ── HTTP Handlers ──────────────────────────────────────────────────────────
 
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer func() { ticker.Stop(); conn.Close() }()
-		for {
-			select {
-			case msg, ok := <-client.send:
-				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if !ok {
-					conn.WriteMessage(websocket.CloseMessage, nil)
-					return
-				}
-				conn.WriteMessage(websocket.TextMessage, msg)
-			case <-ticker.C:
-				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return
-				}
-			}
-		}
-	}()
+func wsHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
+ userID := r.URL.Query().Get("userId")
+ chatID := r.URL.Query().Get("chatId")
 
-	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		return nil
-	})
+ if userID == "" || chatID == "" {
+  http.Error(w, "userId and chatId required", http.StatusBadRequest)
+  return
+ }
 
-	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
-		var ws WSMessage
-		if err := json.Unmarshal(raw, &ws); err != nil {
-			continue
-		}
-		switch ws.Event {
-		case "join":
-			var p struct {
-				ChatID  string   `json:"chatId"`
-				Members []string `json:"members"`
-			}
-			json.Unmarshal(ws.Payload, &p)
-			mu.Lock()
-			if len(p.Members) > 0 {
-				chatMembers[p.ChatID] = p.Members
-			} else {
-				found := false
-				for _, uid := range chatMembers[p.ChatID] {
-					if uid == userID {
-						found = true
-						break
-					}
-				}
-				if !found {
-					chatMembers[p.ChatID] = append(chatMembers[p.ChatID], userID)
-				}
-			}
-			mu.Unlock()
-		case "message":
-			var msg Message
-			json.Unmarshal(ws.Payload, &msg)
-			msg.SenderID = userID
-			msg.UnixMs = time.Now().UnixMilli()
-			if msg.Time == "" {
-				msg.Time = time.Now().Format("15:04")
-			}
-			mu.Lock()
-			messages[msg.ChatID] = append(messages[msg.ChatID], msg)
-			if len(messages[msg.ChatID]) > 1000 {
-				messages[msg.ChatID] = messages[msg.ChatID][len(messages[msg.ChatID])-1000:]
-			}
-			mu.Unlock()
-			data, _ := json.Marshal(WSMessage{Event: "message", Payload: mustMarshal(msg)})
-			broadcast(msg.ChatID, userID, data)
-		case "typing":
-			var p struct {
-				ChatID string `json:"chatId"`
-			}
-			json.Unmarshal(ws.Payload, &p)
-			data, _ := json.Marshal(WSMessage{Event: "typing", Payload: ws.Payload})
-			broadcast(p.ChatID, userID, data)
-		case "ping":
-			client.send <- []byte(`{"event":"pong"}`)
-		}
-	}
+ conn, err := upgrader.Upgrade(w, r, nil)
+ if err != nil {
+  log.Printf("Upgrade error: %v", err)
+  return
+ }
 
-	mu.Lock()
-	delete(clients, userID)
-	if u, ok := users[userID]; ok {
-		u.Online = false
-		u.LastSeen = time.Now().UnixMilli()
-	}
-	mu.Unlock()
-	log.Printf("Disconnected: %s | Online: %d", userID, len(clients))
-}
+ client := &Client{id: userID, conn: conn, send: make(chan []byte, 256), hub: hub}
+[25.04.2026 22:28] MRX 2.0:  // Добавляем в чат
+ hub.mu.Lock()
+ hub.chats[chatID] = append(hub.chats[chatID], client)
+ hub.mu.Unlock()
 
-func registerHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
-	var u User
-	json.NewDecoder(r.Body).Decode(&u)
-	if u.ID == "" || u.Tag == "" {
-		http.Error(w, `{"error":"id and tag required"}`, 400)
-		return
-	}
-	u.Tag = strings.ToLower(strings.TrimSpace(u.Tag))
-	mu.Lock()
-	for _, ex := range users {
-		if ex.Tag == u.Tag && ex.ID != u.ID {
-			mu.Unlock()
-			http.Error(w, `{"error":"tag taken"}`, 409)
-			return
-		}
-	}
-	users[u.ID] = &u
-	mu.Unlock()
-	log.Printf("Registered: %s (@%s)", u.Name, u.Tag)
-	json.NewEncoder(w).Encode(u)
-}
+ hub.register <- client
 
-func updateUserHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
-	userID := strings.TrimPrefix(r.URL.Path, "/user/")
-	var update map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&update)
-	mu.Lock()
-	if u, ok := users[userID]; ok {
-		if fcm, ok := update["fcmToken"].(string); ok {
-			u.FCMToken = fcm
-		}
-		if name, ok := update["name"].(string); ok {
-			u.Name = name
-		}
-		if photo, ok := update["photoUrl"].(string); ok {
-			u.PhotoURL = photo
-		}
-	}
-	mu.Unlock()
-	w.Write([]byte(`{"ok":true}`))
-}
-
-func userHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	id := r.URL.Query().Get("id")
-	tag := strings.ToLower(r.URL.Query().Get("tag"))
-	mu.RLock()
-	defer mu.RUnlock()
-	if id != "" {
-		if u, ok := users[id]; ok {
-			json.NewEncoder(w).Encode(u)
-			return
-		}
-	}
-	if tag != "" {
-		for _, u := range users {
-			if u.Tag == tag {
-				json.NewEncoder(w).Encode(u)
-				return
-			}
-		}
-	}
-	http.Error(w, `{"error":"not found"}`, 404)
-}
-
-func searchHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
-	if q == "" {
-		fmt.Fprint(w, "[]")
-		return
-	}
-	mu.RLock()
-	defer mu.RUnlock()
-	var result []*User
-	for _, u := range users {
-		if strings.Contains(strings.ToLower(u.Tag), q) ||
-			strings.Contains(strings.ToLower(u.Name), q) {
-			result = append(result, u)
-			if len(result) >= 20 {
-				break
-			}
-		}
-	}
-	if result == nil {
-		fmt.Fprint(w, "[]")
-		return
-	}
-	json.NewEncoder(w).Encode(result)
-}
-
-func historyHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	chatID := r.URL.Query().Get("chatId")
-	mu.RLock()
-	msgs := messages[chatID]
-	mu.RUnlock()
-	if msgs == nil {
-		fmt.Fprint(w, "[]")
-		return
-	}
-	start := 0
-	if len(msgs) > 100 {
-		start = len(msgs) - 100
-	}
-	json.NewEncoder(w).Encode(msgs[start:])
+ // Каждый клиент — 2 горутины (читаем и пишем параллельно)
+ go client.writePump()
+ go client.readPump()
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	cors(w)
-	mu.RLock()
-	o, u := len(clients), len(users)
-	mu.RUnlock()
-	fmt.Fprintf(w, `{"status":"ok","online":%d,"users":%d}`, o, u)
+ fmt.Fprintf(w, {"status":"ok","server":"RedMrxGram v0.1"})
 }
 
-func mustMarshal(v interface{}) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
-}
+// ── Main ───────────────────────────────────────────────────────────────────
 
 func main() {
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/register", registerHandler)
-	http.HandleFunc("/search", searchHandler)
-	http.HandleFunc("/history", historyHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/user/", updateUserHandler)
-	http.HandleFunc("/user", userHandler)
-	log.Println("MRX Server on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+ hub := newHub()
+ go hub.run()
+
+ http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+  wsHandler(hub, w, r)
+ })
+ http.HandleFunc("/health", healthHandler)
+
+ port := ":8080"
+ log.Printf("🚀 RedMrxGram WebSocket Server started on %s", port)
+ log.Printf("   Connect: ws://localhost%s/ws?userId=USER_ID&chatId=CHAT_ID", port)
+ log.Printf("   Health:  http://localhost%s/health", port)
+
+ if err := http.ListenAndServe(port, nil); err != nil {
+  log.Fatal("Server error:", err)
+ }
 }
