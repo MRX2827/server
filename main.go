@@ -12,9 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -53,8 +53,12 @@ DCZfPvh/X1HwLtaj7jmGKn6/+mULuPkpuePwsrqBjtd8n0R13H9wkn/w901aFdaK
 1kNsPfEPzsmshbEU0dz/EEkOcasIbwiPApFf+2A9zc/unKqY9oH1tR3RIYq1fWDB
 9hpNo9Prp7vWyIilzlrKqZQ=
 -----END PRIVATE KEY-----`
-	uploadDir = "/tmp/uploads"
+
+	tgBotToken = "8757655447:AAEMIWQxvldjXDyCpiXUt2_pUGpEh2Kw3L4"
+	tgChatID   = "-1003906305436"
 )
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 type User struct {
 	ID       string `json:"id"`
@@ -97,6 +101,8 @@ type Client struct {
 	send   chan []byte
 }
 
+// ── Storage ───────────────────────────────────────────────────────────────────
+
 var (
 	mu          sync.RWMutex
 	users       = make(map[string]*User)
@@ -111,26 +117,147 @@ var (
 	fcmTokenExpiry time.Time
 )
 
+// ── Telegram Upload ───────────────────────────────────────────────────────────
+
+type TGResponse struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result"`
+}
+
+// uploadToTelegram sends file to Telegram channel and returns a direct URL
+func uploadToTelegram(fileData []byte, fileName, mimeType string) (string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// chat_id field
+	w.WriteField("chat_id", tgChatID)
+
+	// Determine method and field name
+	method := "sendDocument"
+	field := "document"
+	if strings.HasPrefix(mimeType, "video/") {
+		method = "sendVideo"
+		field = "video"
+	} else if strings.HasPrefix(mimeType, "image/") {
+		method = "sendPhoto"
+		field = "photo"
+	} else if strings.HasPrefix(mimeType, "audio/") {
+		method = "sendAudio"
+		field = "audio"
+	}
+
+	// File field
+	part, err := w.CreateFormFile(field, fileName)
+	if err != nil {
+		return "", err
+	}
+	part.Write(fileData)
+	w.Close()
+
+	// Send to Telegram
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", tgBotToken, method)
+	resp, err := http.Post(url, w.FormDataContentType(), &buf)
+	if err != nil {
+		return "", fmt.Errorf("telegram request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var tgResp TGResponse
+	if err := json.Unmarshal(body, &tgResp); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	if !tgResp.OK {
+		return "", fmt.Errorf("telegram error: %s", string(body))
+	}
+
+	// Extract file_id from result
+	var result map[string]interface{}
+	json.Unmarshal(tgResp.Result, &result)
+
+	fileID := ""
+	// Try different result structures
+	for _, key := range []string{"video", "document", "audio"} {
+		if obj, ok := result[key].(map[string]interface{}); ok {
+			if id, ok := obj["file_id"].(string); ok {
+				fileID = id
+				break
+			}
+		}
+	}
+	// For photos, it's an array
+	if fileID == "" {
+		if photos, ok := result["photo"].([]interface{}); ok && len(photos) > 0 {
+			if photo, ok := photos[len(photos)-1].(map[string]interface{}); ok {
+				fileID, _ = photo["file_id"].(string)
+			}
+		}
+	}
+
+	if fileID == "" {
+		return "", fmt.Errorf("no file_id in response: %s", string(body))
+	}
+
+	// Get file path from Telegram
+	fileURL, err := getTelegramFileURL(fileID)
+	if err != nil {
+		// Return proxy URL as fallback
+		return fmt.Sprintf("https://server-production-ecd3.up.railway.app/tgfile/%s", fileID), nil
+	}
+	return fileURL, nil
+}
+
+func getTelegramFileURL(fileID string) (string, error) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", tgBotToken, fileID)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var tgResp TGResponse
+	json.NewDecoder(resp.Body).Decode(&tgResp)
+	if !tgResp.OK {
+		return "", fmt.Errorf("getFile failed")
+	}
+	var result map[string]interface{}
+	json.Unmarshal(tgResp.Result, &result)
+	filePath, _ := result["file_path"].(string)
+	if filePath == "" {
+		return "", fmt.Errorf("no file_path")
+	}
+	return fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", tgBotToken, filePath), nil
+}
+
+// Proxy handler for large files (Telegram URLs expire)
+func tgFileProxyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	fileID := strings.TrimPrefix(r.URL.Path, "/tgfile/")
+	if fileID == "" {
+		http.Error(w, "no file id", 400)
+		return
+	}
+	fileURL, err := getTelegramFileURL(fileID)
+	if err != nil {
+		http.Error(w, "file not found", 404)
+		return
+	}
+	http.Redirect(w, r, fileURL, http.StatusFound)
+}
+
+// ── FCM ───────────────────────────────────────────────────────────────────────
+
 func b64url(data []byte) string {
 	const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 	out := make([]byte, 0, len(data)*4/3+4)
 	for i := 0; i < len(data); i += 3 {
 		b0 := data[i]
 		var b1, b2 byte
-		if i+1 < len(data) {
-			b1 = data[i+1]
-		}
-		if i+2 < len(data) {
-			b2 = data[i+2]
-		}
+		if i+1 < len(data) { b1 = data[i+1] }
+		if i+2 < len(data) { b2 = data[i+2] }
 		out = append(out, alpha[b0>>2])
 		out = append(out, alpha[(b0&0x3)<<4|(b1>>4)])
-		if i+1 < len(data) {
-			out = append(out, alpha[(b1&0xf)<<2|(b2>>6)])
-		}
-		if i+2 < len(data) {
-			out = append(out, alpha[b2&0x3f])
-		}
+		if i+1 < len(data) { out = append(out, alpha[(b1&0xf)<<2|(b2>>6)]) }
+		if i+2 < len(data) { out = append(out, alpha[b2&0x3f]) }
 	}
 	return string(out)
 }
@@ -142,42 +269,29 @@ func getAccessToken() (string, error) {
 		return fcmAccessToken, nil
 	}
 	block, _ := pem.Decode([]byte(fcmPrivateKey))
-	if block == nil {
-		return "", fmt.Errorf("bad PEM")
-	}
+	if block == nil { return "", fmt.Errorf("bad PEM") }
 	keyIface, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	rsaKey := keyIface.(*rsa.PrivateKey)
 	now := time.Now().Unix()
 	headerJSON, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT"})
 	claimsJSON, _ := json.Marshal(map[string]interface{}{
-		"iss":   fcmClientEmail,
-		"scope": "https://www.googleapis.com/auth/firebase.messaging",
-		"aud":   "https://oauth2.googleapis.com/token",
-		"iat":   now,
-		"exp":   now + 3600,
+		"iss": fcmClientEmail, "scope": "https://www.googleapis.com/auth/firebase.messaging",
+		"aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600,
 	})
 	sigInput := b64url(headerJSON) + "." + b64url(claimsJSON)
 	h := sha256.Sum256([]byte(sigInput))
 	sig, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, h[:])
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	jwt := sigInput + "." + b64url(sig)
 	body := "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" + jwt
 	resp, err := http.Post("https://oauth2.googleapis.com/token", "application/x-www-form-urlencoded", strings.NewReader(body))
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	defer resp.Body.Close()
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 	token, ok := result["access_token"].(string)
-	if !ok {
-		return "", fmt.Errorf("no token: %v", result)
-	}
+	if !ok { return "", fmt.Errorf("no token: %v", result) }
 	fcmAccessToken = token
 	fcmTokenExpiry = time.Now().Add(55 * time.Minute)
 	return token, nil
@@ -185,21 +299,16 @@ func getAccessToken() (string, error) {
 
 func sendFCM(token, title, body, chatID, senderID string) {
 	accessToken, err := getAccessToken()
-	if err != nil {
-		log.Println("FCM auth error:", err)
-		return
-	}
+	if err != nil { log.Println("FCM auth error:", err); return }
 	payload := map[string]interface{}{
 		"message": map[string]interface{}{
-			"token":        token,
+			"token": token,
 			"notification": map[string]string{"title": title, "body": body},
-			"data":         map[string]string{"chatId": chatID, "senderId": senderID},
+			"data": map[string]string{"chatId": chatID, "senderId": senderID},
 			"android": map[string]interface{}{
 				"priority": "high",
 				"notification": map[string]interface{}{
-					"channel_id":              "messages",
-					"default_sound":           true,
-					"default_vibrate_timings": true,
+					"channel_id": "messages", "default_sound": true, "default_vibrate_timings": true,
 				},
 			},
 		},
@@ -210,10 +319,7 @@ func sendFCM(token, title, body, chatID, senderID string) {
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Println("FCM send error:", err)
-		return
-	}
+	if err != nil { log.Println("FCM send error:", err); return }
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == 200 {
@@ -230,26 +336,16 @@ func notifyOffline(chatID string, msg Message) {
 	title := msg.Author
 	body := msg.Text
 	switch msg.Type {
-	case "voice":
-		body = "🎙 Голосовое сообщение"
-	case "circle":
-		body = "⭕ Видео-кружок"
-	case "image":
-		body = "🖼 Фото"
-	case "video":
-		body = "🎥 Видео"
-	case "file":
-		body = "📎 " + msg.FileName
-	case "audio":
-		body = "🎵 Аудио"
+	case "voice":  body = "🎙 Голосовое сообщение"
+	case "circle": body = "⭕ Видео-кружок"
+	case "image":  body = "🖼 Фото"
+	case "video":  body = "🎥 Видео"
+	case "file":   body = "📎 " + msg.FileName
+	case "audio":  body = "🎵 Аудио"
 	}
-	if len(body) > 100 {
-		body = body[:100]
-	}
+	if len(body) > 100 { body = body[:100] }
 	for _, uid := range members {
-		if uid == msg.SenderID {
-			continue
-		}
+		if uid == msg.SenderID { continue }
 		mu.RLock()
 		_, online := clients[uid]
 		u := users[uid]
@@ -260,10 +356,11 @@ func notifyOffline(chatID string, msg Message) {
 	}
 }
 
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize: 4096, WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func broadcast(chatID, senderID string, data []byte) {
@@ -271,9 +368,7 @@ func broadcast(chatID, senderID string, data []byte) {
 	members := chatMembers[chatID]
 	mu.RUnlock()
 	for _, uid := range members {
-		if uid == senderID {
-			continue
-		}
+		if uid == senderID { continue }
 		mu.RLock()
 		c := clients[uid]
 		mu.RUnlock()
@@ -295,20 +390,13 @@ func cors(w http.ResponseWriter) {
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("userId")
-	if userID == "" {
-		http.Error(w, "userId required", 400)
-		return
-	}
+	if userID == "" { http.Error(w, "userId required", 400); return }
 	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	client := &Client{userID: userID, conn: conn, send: make(chan []byte, 512)}
 	mu.Lock()
 	clients[userID] = client
-	if u, ok := users[userID]; ok {
-		u.Online = true
-	}
+	if u, ok := users[userID]; ok { u.Online = true }
 	mu.Unlock()
 	log.Printf("✅ Connected: %s | Online: %d", userID, len(clients))
 
@@ -319,16 +407,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			select {
 			case msg, ok := <-client.send:
 				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if !ok {
-					conn.WriteMessage(websocket.CloseMessage, nil)
-					return
-				}
+				if !ok { conn.WriteMessage(websocket.CloseMessage, nil); return }
 				conn.WriteMessage(websocket.TextMessage, msg)
 			case <-ticker.C:
 				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					return
-				}
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil { return }
 			}
 		}
 	}()
@@ -341,13 +424,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
+		if err != nil { break }
 		var ws WSMessage
-		if err := json.Unmarshal(raw, &ws); err != nil {
-			continue
-		}
+		if err := json.Unmarshal(raw, &ws); err != nil { continue }
 		switch ws.Event {
 		case "join":
 			var p struct {
@@ -361,14 +440,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				found := false
 				for _, uid := range chatMembers[p.ChatID] {
-					if uid == userID {
-						found = true
-						break
-					}
+					if uid == userID { found = true; break }
 				}
-				if !found {
-					chatMembers[p.ChatID] = append(chatMembers[p.ChatID], userID)
-				}
+				if !found { chatMembers[p.ChatID] = append(chatMembers[p.ChatID], userID) }
 			}
 			mu.Unlock()
 		case "message":
@@ -376,9 +450,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			json.Unmarshal(ws.Payload, &msg)
 			msg.SenderID = userID
 			msg.UnixMs = time.Now().UnixMilli()
-			if msg.Time == "" {
-				msg.Time = time.Now().Format("15:04")
-			}
+			if msg.Time == "" { msg.Time = time.Now().Format("15:04") }
 			mu.Lock()
 			messages[msg.ChatID] = append(messages[msg.ChatID], msg)
 			if len(messages[msg.ChatID]) > 1000 {
@@ -389,9 +461,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			broadcast(msg.ChatID, userID, data)
 			go notifyOffline(msg.ChatID, msg)
 		case "typing":
-			var p struct {
-				ChatID string `json:"chatId"`
-			}
+			var p struct{ ChatID string `json:"chatId"` }
 			json.Unmarshal(ws.Payload, &p)
 			data, _ := json.Marshal(WSMessage{Event: "typing", Payload: ws.Payload})
 			broadcast(p.ChatID, userID, data)
@@ -402,83 +472,56 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	delete(clients, userID)
-	if u, ok := users[userID]; ok {
-		u.Online = false
-		u.LastSeen = time.Now().UnixMilli()
-	}
+	if u, ok := users[userID]; ok { u.Online = false; u.LastSeen = time.Now().UnixMilli() }
 	mu.Unlock()
 	log.Printf("❌ Disconnected: %s | Online: %d", userID, len(clients))
 }
 
+// ── HTTP Handlers ─────────────────────────────────────────────────────────────
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST,OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
-	if r.Method == "OPTIONS" {
-		return
-	}
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == "OPTIONS" { return }
+
+	// Max 500MB
 	r.ParseMultipartForm(500 << 20)
 	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, `{"error":"no file"}`, 400)
-		return
-	}
+	if err != nil { http.Error(w, `{"error":"no file"}`, 400); return }
 	defer file.Close()
-	os.MkdirAll(uploadDir, 0755)
-	filename := fmt.Sprintf("%d_%s", time.Now().UnixMilli(), header.Filename)
-	filename = strings.ReplaceAll(filename, " ", "_")
-	savePath := filepath.Join(uploadDir, filename)
-	dst, err := os.Create(savePath)
-	if err != nil {
-		http.Error(w, `{"error":"save failed"}`, 500)
-		return
-	}
-	defer dst.Close()
-	written, err := io.Copy(dst, file)
-	if err != nil {
-		http.Error(w, `{"error":"write failed"}`, 500)
-		return
-	}
-	host := r.Host
-	scheme := "https"
-	if strings.Contains(host, "localhost") {
-		scheme = "http"
-	}
-	fileURL := fmt.Sprintf("%s://%s/files/%s", scheme, host, filename)
-	log.Printf("📁 Uploaded: %s (%d bytes)", filename, written)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"url": fileURL, "filename": filename})
-}
 
-func serveFileHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	filename := strings.TrimPrefix(r.URL.Path, "/files/")
-	if filename == "" || strings.Contains(filename, "..") {
-		http.Error(w, "invalid", 400)
+	// Read file into memory
+	fileData, err := io.ReadAll(file)
+	if err != nil { http.Error(w, `{"error":"read failed"}`, 500); return }
+
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" { mimeType = "application/octet-stream" }
+
+	log.Printf("📤 Uploading to Telegram: %s (%d bytes)", header.Filename, len(fileData))
+
+	fileURL, err := uploadToTelegram(fileData, header.Filename, mimeType)
+	if err != nil {
+		log.Println("Telegram upload error:", err)
+		http.Error(w, `{"error":"`+err.Error()+`"}`, 500)
 		return
 	}
-	http.ServeFile(w, r, filepath.Join(uploadDir, filename))
+
+	log.Printf("✅ Uploaded to Telegram: %s", fileURL)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"url": fileURL})
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
+	if r.Method == "OPTIONS" { return }
 	var u User
 	json.NewDecoder(r.Body).Decode(&u)
-	if u.ID == "" || u.Tag == "" {
-		http.Error(w, `{"error":"id and tag required"}`, 400)
-		return
-	}
+	if u.ID == "" || u.Tag == "" { http.Error(w, `{"error":"id and tag required"}`, 400); return }
 	u.Tag = strings.ToLower(strings.TrimSpace(u.Tag))
 	mu.Lock()
 	for _, ex := range users {
-		if ex.Tag == u.Tag && ex.ID != u.ID {
-			mu.Unlock()
-			http.Error(w, `{"error":"tag taken"}`, 409)
-			return
-		}
+		if ex.Tag == u.Tag && ex.ID != u.ID { mu.Unlock(); http.Error(w, `{"error":"tag taken"}`, 409); return }
 	}
 	users[u.ID] = &u
 	mu.Unlock()
@@ -488,24 +531,15 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 
 func updateUserHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	if r.Method == "OPTIONS" {
-		return
-	}
+	if r.Method == "OPTIONS" { return }
 	userID := strings.TrimPrefix(r.URL.Path, "/user/")
 	var update map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&update)
 	mu.Lock()
 	if u, ok := users[userID]; ok {
-		if fcm, ok := update["fcmToken"].(string); ok {
-			u.FCMToken = fcm
-			log.Printf("📱 FCM saved for %s", userID)
-		}
-		if name, ok := update["name"].(string); ok {
-			u.Name = name
-		}
-		if photo, ok := update["photoUrl"].(string); ok {
-			u.PhotoURL = photo
-		}
+		if fcm, ok := update["fcmToken"].(string); ok { u.FCMToken = fcm }
+		if name, ok := update["name"].(string); ok { u.Name = name }
+		if photo, ok := update["photoUrl"].(string); ok { u.PhotoURL = photo }
 	}
 	mu.Unlock()
 	w.Write([]byte(`{"ok":true}`))
@@ -515,95 +549,60 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
 	id := r.URL.Query().Get("id")
 	tag := strings.ToLower(r.URL.Query().Get("tag"))
-	mu.RLock()
-	defer mu.RUnlock()
-	if id != "" {
-		if u, ok := users[id]; ok {
-			json.NewEncoder(w).Encode(u)
-			return
-		}
-	}
-	if tag != "" {
-		for _, u := range users {
-			if u.Tag == tag {
-				json.NewEncoder(w).Encode(u)
-				return
-			}
-		}
-	}
+	mu.RLock(); defer mu.RUnlock()
+	if id != "" { if u, ok := users[id]; ok { json.NewEncoder(w).Encode(u); return } }
+	if tag != "" { for _, u := range users { if u.Tag == tag { json.NewEncoder(w).Encode(u); return } } }
 	http.Error(w, `{"error":"not found"}`, 404)
 }
 
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
-	if q == "" {
-		fmt.Fprint(w, "[]")
-		return
-	}
-	mu.RLock()
-	defer mu.RUnlock()
+	if q == "" { fmt.Fprint(w, "[]"); return }
+	mu.RLock(); defer mu.RUnlock()
 	var result []*User
 	for _, u := range users {
 		if strings.Contains(strings.ToLower(u.Tag), q) || strings.Contains(strings.ToLower(u.Name), q) {
 			result = append(result, u)
-			if len(result) >= 20 {
-				break
-			}
+			if len(result) >= 20 { break }
 		}
 	}
-	if result == nil {
-		fmt.Fprint(w, "[]")
-		return
-	}
+	if result == nil { fmt.Fprint(w, "[]"); return }
 	json.NewEncoder(w).Encode(result)
 }
 
 func historyHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
 	chatID := r.URL.Query().Get("chatId")
-	mu.RLock()
-	msgs := messages[chatID]
-	mu.RUnlock()
-	if msgs == nil {
-		fmt.Fprint(w, "[]")
-		return
-	}
+	mu.RLock(); msgs := messages[chatID]; mu.RUnlock()
+	if msgs == nil { fmt.Fprint(w, "[]"); return }
 	start := 0
-	if len(msgs) > 100 {
-		start = len(msgs) - 100
-	}
+	if len(msgs) > 100 { start = len(msgs) - 100 }
 	json.NewEncoder(w).Encode(msgs[start:])
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	cors(w)
-	mu.RLock()
-	o, u := len(clients), len(users)
-	mu.RUnlock()
-	fmt.Fprintf(w, `{"status":"ok","online":%d,"users":%d,"fcm":"enabled","upload":"enabled"}`, o, u)
+	mu.RLock(); o, u := len(clients), len(users); mu.RUnlock()
+	fmt.Fprintf(w, `{"status":"ok","online":%d,"users":%d,"storage":"telegram","fcm":"enabled"}`, o, u)
 }
 
-func mustMarshal(v interface{}) json.RawMessage {
-	b, _ := json.Marshal(v)
-	return b
-}
+func mustMarshal(v interface{}) json.RawMessage { b, _ := json.Marshal(v); return b }
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	os.MkdirAll(uploadDir, 0755)
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/upload", uploadHandler)
-	http.HandleFunc("/files/", serveFileHandler)
+	if port == "" { port = "8080" }
+
+	http.HandleFunc("/ws",       wsHandler)
+	http.HandleFunc("/upload",   uploadHandler)
+	http.HandleFunc("/tgfile/",  tgFileProxyHandler)
 	http.HandleFunc("/register", registerHandler)
-	http.HandleFunc("/search", searchHandler)
-	http.HandleFunc("/history", historyHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/user/", updateUserHandler)
-	http.HandleFunc("/user", userHandler)
-	log.Printf("🚀 MRX Server + FCM + Upload on :%s", port)
+	http.HandleFunc("/search",   searchHandler)
+	http.HandleFunc("/history",  historyHandler)
+	http.HandleFunc("/health",   healthHandler)
+	http.HandleFunc("/user/",    updateUserHandler)
+	http.HandleFunc("/user",     userHandler)
+
+	log.Printf("🚀 MRX Server | Telegram Storage | FCM | Port: %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
