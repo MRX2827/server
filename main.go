@@ -589,6 +589,58 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 func mustMarshal(v interface{}) json.RawMessage { b, _ := json.Marshal(v); return b }
 
+// POST /notify — called by app after sending message to Firebase
+// Sends FCM push to offline users
+func notifyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST,OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == "OPTIONS" { return }
+
+	var req struct {
+		ChatID     string   `json:"chatId"`
+		SenderID   string   `json:"senderId"`
+		SenderName string   `json:"senderName"`
+		Members    []string `json:"members"`
+		Text       string   `json:"text"`
+		Type       string   `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"bad request"}`, 400)
+		return
+	}
+
+	// Build notification body
+	body := req.Text
+	switch req.Type {
+	case "voice":  body = "🎙 Голосовое сообщение"
+	case "circle": body = "⭕ Видео-кружок"
+	case "image":  body = "🖼 Фото"
+	case "video":  body = "🎥 Видео"
+	case "file":   body = "📎 Файл"
+	case "audio":  body = "🎵 Аудио"
+	}
+	if len(body) > 100 { body = body[:100] }
+	if body == "" { body = "Новое сообщение" }
+
+	sent := 0
+	mu.RLock()
+	for _, uid := range req.Members {
+		if uid == req.SenderID { continue }
+		u := users[uid]
+		_, online := clients[uid]
+		if u != nil && u.FCMToken != "" && !online {
+			go sendFCM(u.FCMToken, req.SenderName, body, req.ChatID, req.SenderID)
+			sent++
+		}
+	}
+	mu.RUnlock()
+
+	log.Printf("🔔 Notify: chat=%s sender=%s sent=%d", req.ChatID, req.SenderName, sent)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"sent":%d}`, sent)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
