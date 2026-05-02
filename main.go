@@ -646,6 +646,7 @@ func main() {
 	if port == "" { port = "8080" }
 
 	http.HandleFunc("/ws",       wsHandler)
+	http.HandleFunc("/notify",   notifyHandler)
 	http.HandleFunc("/upload",   uploadHandler)
 	http.HandleFunc("/tgfile/",  tgFileProxyHandler)
 	http.HandleFunc("/register", registerHandler)
