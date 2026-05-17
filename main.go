@@ -789,20 +789,12 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Tokens) > 0 {
 		// ✅ Новый способ: токены переданы клиентом из Firestore
+		// Фильтрация (active chat / online) выполняется на клиенте через pushNotificationReceived listener
 		for uid, token := range req.Tokens {
 			if uid == req.SenderID {
 				continue
 			}
-			mu.RLock()
-			_, online := clients[uid]
-			recipientChat := activeChats[uid]
-			mu.RUnlock()
-			// Не шлём FCM если получатель прямо сейчас в этом чате
-			if recipientChat == req.ChatID {
-				log.Printf("⏭ Skip FCM for %s — в чате %s", uid, req.ChatID)
-				continue
-			}
-			if !online && token != "" {
+			if token != "" {
 				go sendFCM(token, req.SenderName, body, req.ChatID, req.SenderID)
 				sent++
 			}
@@ -815,14 +807,8 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			mu.RLock()
 			u := users[uid]
-			_, online := clients[uid]
-			recipientChat := activeChats[uid]
 			mu.RUnlock()
-			if recipientChat == req.ChatID {
-				log.Printf("⏭ Skip FCM for %s — в чате %s", uid, req.ChatID)
-				continue
-			}
-			if u != nil && u.FCMToken != "" && !online {
+			if u != nil && u.FCMToken != "" {
 				go sendFCM(u.FCMToken, req.SenderName, body, req.ChatID, req.SenderID)
 				sent++
 			}
