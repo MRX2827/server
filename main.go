@@ -319,13 +319,18 @@ func sendFCM(token, title, body, chatID, senderID string) {
 		"message": map[string]interface{}{
 			"token":        token,
 			"notification": map[string]string{"title": title, "body": body},
-			"data":         map[string]string{"chatId": chatID, "senderId": senderID},
+			"data": map[string]string{
+				"chatId":   chatID,
+				"senderId": senderID,
+			},
 			"android": map[string]interface{}{
 				"priority": "high",
+				"ttl":      "86400s", // 24h TTL — не доставлять старые уведомления
 				"notification": map[string]interface{}{
 					"channel_id":              "messages",
 					"default_sound":           true,
 					"default_vibrate_timings": true,
+					"tag":                     chatID, // группировка: новое уведомление из чата заменяет старое
 				},
 			},
 		},
