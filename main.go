@@ -192,20 +192,11 @@ func uploadToTelegram(fileData []byte, fileName, mimeType string) (string, error
 		return "", fmt.Errorf("no file_id in response: %s", string(body))
 	}
 
-	// Всегда возвращаем прокси-URL, а не прямой api.telegram.org.
-	//
-	// Прямой URL вида https://api.telegram.org/file/bot<TOKEN>/<file_path>
-	// живёт по документации Telegram «не менее часа», а на практике —
-	// до тех пор, пока Telegram не пересоберёт внутренние file_path'ы
-	// для неактивных файлов (через несколько дней/недель). После этого
-	// прямая ссылка возвращает 404, и файл из Firestore становится
-	// недоступен ни ручному скачиванию, ни оффлайн-кэшу.
-	//
-	// Прокси /tgfile/{fileID} при каждом запросе делает свежий getFile
-	// → 302 redirect на актуальный URL. fileID, в отличие от file_path,
-	// у Telegram стабилен — ссылка через прокси работает вечно (пока
-	// существует сам файл на стороне Telegram).
-	return fmt.Sprintf("https://server-production-ecd3.up.railway.app/tgfile/%s", fileID), nil
+	fileURL, err := getTelegramFileURL(fileID)
+	if err != nil {
+		return fmt.Sprintf("https://server-production-ecd3.up.railway.app/tgfile/%s", fileID), nil
+	}
+	return fileURL, nil
 }
 
 func getTelegramFileURL(fileID string) (string, error) {
