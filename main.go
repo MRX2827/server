@@ -111,7 +111,14 @@ var (
 	chatMembers = make(map[string][]string)
 	// uid → chatId: какой чат сейчас открыт у пользователя
 	activeChats = make(map[string]string)
+	// uid → unix ms последнего presence-обновления. Если клиент молчит дольше
+	// activeChatTTLMs, presence считается несвежим и FCM шлётся как обычно
+	// (страхует от случая, когда WebView заморожен на Android и leaveChat не
+	// успел улететь до того, как ОС приостановила JS).
+	activeChatsTs = make(map[string]int64)
 )
+
+const activeChatTTLMs = 25_000 // 25 секунд
 
 var (
 	fcmTokenMu     sync.Mutex
@@ -385,9 +392,11 @@ func notifyOffline(chatID string, msg Message) {
 		_, online := clients[uid]
 		u := users[uid]
 		activeChat := activeChats[uid]
+		activeTs := activeChatsTs[uid]
 		mu.RUnlock()
-		// Не шлём, если получатель сейчас открыт в этом же чате.
-		if activeChat == chatID {
+		// Не шлём, если получатель прямо сейчас (свежий presence) открыт в этом же чате.
+		fresh := time.Now().UnixMilli()-activeTs < activeChatTTLMs
+		if activeChat == chatID && fresh {
 			continue
 		}
 		if !online && u != nil && u.FCMToken != "" {
@@ -544,6 +553,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	// Иначе при крахе приложения он навсегда останется "в чате" и не будет
 	// получать оттуда FCM.
 	delete(activeChats, userID)
+	delete(activeChatsTs, userID)
 	if u, ok := users[userID]; ok {
 		u.Online = false
 		u.LastSeen = time.Now().UnixMilli()
@@ -740,8 +750,10 @@ func presenceHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	if req.ChatID == "" {
 		delete(activeChats, req.UID)
+		delete(activeChatsTs, req.UID)
 	} else {
 		activeChats[req.UID] = req.ChatID
+		activeChatsTs[req.UID] = time.Now().UnixMilli()
 	}
 	mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -809,9 +821,13 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			mu.RLock()
 			activeChat := activeChats[uid]
+			activeTs := activeChatsTs[uid]
 			mu.RUnlock()
-			if activeChat == req.ChatID {
-				// Получатель прямо сейчас открыт в этом чате — push не нужен.
+			// Скипаем FCM, только если presence свежий (клиент шлёт heartbeat).
+			// Иначе считаем что юзера в чате нет (WebView заморожен / приложение
+			// убито / сеть оборвалась) и push нужно отправить.
+			fresh := time.Now().UnixMilli()-activeTs < activeChatTTLMs
+			if activeChat == req.ChatID && fresh {
 				skipped++
 				continue
 			}
@@ -828,9 +844,11 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			mu.RLock()
 			activeChat := activeChats[uid]
+			activeTs := activeChatsTs[uid]
 			u := users[uid]
 			mu.RUnlock()
-			if activeChat == req.ChatID {
+			fresh := time.Now().UnixMilli()-activeTs < activeChatTTLMs
+			if activeChat == req.ChatID && fresh {
 				skipped++
 				continue
 			}
