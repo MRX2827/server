@@ -384,7 +384,12 @@ func notifyOffline(chatID string, msg Message) {
 		mu.RLock()
 		_, online := clients[uid]
 		u := users[uid]
+		activeChat := activeChats[uid]
 		mu.RUnlock()
+		// Не шлём, если получатель сейчас открыт в этом же чате.
+		if activeChat == chatID {
+			continue
+		}
 		if !online && u != nil && u.FCMToken != "" {
 			go sendFCM(u.FCMToken, title, body, chatID, msg.SenderID)
 		}
@@ -535,6 +540,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	delete(clients, userID)
+	// Отпускаем presence: если соединение разорвано, юзер точно не в чате.
+	// Иначе при крахе приложения он навсегда останется "в чате" и не будет
+	// получать оттуда FCM.
+	delete(activeChats, userID)
 	if u, ok := users[userID]; ok {
 		u.Online = false
 		u.LastSeen = time.Now().UnixMilli()
@@ -786,12 +795,24 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sent := 0
+	skipped := 0
 
 	if len(req.Tokens) > 0 {
-		// ✅ Новый способ: токены переданы клиентом из Firestore
-		// Фильтрация (active chat / online) выполняется на клиенте через pushNotificationReceived listener
+		// ✅ Новый способ: токены переданы клиентом из Firestore.
+		// Фильтрация по активному чату делается ЗДЕСЬ, на сервере — это
+		// единственный надёжный способ не показать системное Android-уведомление,
+		// потому что foreground-listener на клиенте срабатывает уже после того,
+		// как notification успел мелькнуть в шторке.
 		for uid, token := range req.Tokens {
 			if uid == req.SenderID {
+				continue
+			}
+			mu.RLock()
+			activeChat := activeChats[uid]
+			mu.RUnlock()
+			if activeChat == req.ChatID {
+				// Получатель прямо сейчас открыт в этом чате — push не нужен.
+				skipped++
 				continue
 			}
 			if token != "" {
@@ -806,8 +827,13 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			mu.RLock()
+			activeChat := activeChats[uid]
 			u := users[uid]
 			mu.RUnlock()
+			if activeChat == req.ChatID {
+				skipped++
+				continue
+			}
 			if u != nil && u.FCMToken != "" {
 				go sendFCM(u.FCMToken, req.SenderName, body, req.ChatID, req.SenderID)
 				sent++
@@ -815,10 +841,10 @@ func notifyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("🔔 Notify: chat=%s sender=%s tokens=%d sent=%d",
-		req.ChatID, req.SenderName, len(req.Tokens), sent)
+	log.Printf("🔔 Notify: chat=%s sender=%s tokens=%d sent=%d skipped=%d",
+		req.ChatID, req.SenderName, len(req.Tokens), sent, skipped)
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"sent":%d}`, sent)
+	fmt.Fprintf(w, `{"sent":%d,"skipped":%d}`, sent, skipped)
 }
 
 func main() {
